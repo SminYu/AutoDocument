@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
-import re
 import shutil
 import uuid
 import zipfile
@@ -18,7 +16,8 @@ import cv2
 import numpy as np
 import pytesseract
 
-from .utils import business_checksum, normalize_date, to_int_amount
+from .extractor import extract_fields_hybrid
+from .utils import business_checksum
 
 
 LOGGER = logging.getLogger("autodocument")
@@ -172,49 +171,19 @@ def run_ocr(images: list[Path], lang: str = "kor+eng") -> tuple[list[OCRLine], s
     return lines, merged_text
 
 
-def extract_fields(ocr_text: str) -> ExtractedFields:
-    field = ExtractedFields()
-
-    bn = re.search(r"(\d{3}-\d{2}-\d{5}|\d{10})", ocr_text)
-    if bn:
-        digits = re.sub(r"[^0-9]", "", bn.group(1))
-        field.business_number = f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
-
-    date_match = re.search(r"(20\d{2}[./-]\d{1,2}[./-]\d{1,2}|20\d{6})", ocr_text)
-    if date_match:
-        field.approved_at = normalize_date(date_match.group(1))
-
-    total = re.search(r"(?:합계|총액|Total)\s*[: ]?\s*([\d,]+)", ocr_text, re.IGNORECASE)
-    supply = re.search(r"(?:공급가액|공급가)\s*[: ]?\s*([\d,]+)", ocr_text, re.IGNORECASE)
-    vat = re.search(r"(?:부가세|VAT)\s*[: ]?\s*([\d,]+)", ocr_text, re.IGNORECASE)
-
-    if total:
-        field.total_amount = to_int_amount(total.group(1))
-    if supply:
-        field.supply_amount = to_int_amount(supply.group(1))
-    if vat:
-        field.vat_amount = to_int_amount(vat.group(1))
-
-    app_no = re.search(r"(?:승인번호|Approval\s*No)\s*[: ]?\s*([A-Z0-9-]{6,})", ocr_text, re.IGNORECASE)
-    if app_no:
-        field.approval_no = app_no.group(1)
-
-    first_line = next((line.strip() for line in ocr_text.splitlines() if line.strip()), None)
-    field.merchant_name = first_line
-
-    for key in [
-        "merchant_name",
-        "business_number",
-        "approved_at",
-        "supply_amount",
-        "vat_amount",
-        "total_amount",
-        "approval_no",
-    ]:
-        if getattr(field, key) is None:
-            field.reasons[key] = "not_found_by_rules"
-
-    return field
+def extract_fields(ocr_text: str, extraction_mode: str = "llm_hybrid") -> tuple[ExtractedFields, str]:
+    extracted_dict, used_mode = extract_fields_hybrid(ocr_text, mode=extraction_mode)
+    fields = ExtractedFields(
+        merchant_name=extracted_dict.get("merchant_name"),
+        business_number=extracted_dict.get("business_number"),
+        approved_at=extracted_dict.get("approved_at"),
+        supply_amount=extracted_dict.get("supply_amount"),
+        vat_amount=extracted_dict.get("vat_amount"),
+        total_amount=extracted_dict.get("total_amount"),
+        approval_no=extracted_dict.get("approval_no"),
+        reasons=extracted_dict.get("reasons", {}),
+    )
+    return fields, used_mode
 
 
 def validate(fields: ExtractedFields) -> ValidationResult:
@@ -300,7 +269,12 @@ def fill_template(template_path: Path | None, output_dir: Path, fields: Extracte
     return out
 
 
-def run_pipeline(input_path: Path, output_root: Path, template_path: Path | None = None) -> dict[str, Any]:
+def run_pipeline(
+    input_path: Path,
+    output_root: Path,
+    template_path: Path | None = None,
+    extraction_mode: str = "llm_hybrid",
+) -> dict[str, Any]:
     document_id = str(uuid.uuid4())
     run_dir = output_root / document_id
     pre_dir = run_dir / "preprocessed"
@@ -312,7 +286,7 @@ def run_pipeline(input_path: Path, output_root: Path, template_path: Path | None
 
     preprocessed_images = preprocess_image(raw_copy, pre_dir)
     ocr_lines, ocr_text = run_ocr(preprocessed_images)
-    fields = extract_fields(ocr_text)
+    fields, used_extraction_mode = extract_fields(ocr_text, extraction_mode=extraction_mode)
     validation = validate(fields)
     evidence_path = fill_template(template_path, run_dir, fields)
 
@@ -339,7 +313,8 @@ def run_pipeline(input_path: Path, output_root: Path, template_path: Path | None
         },
         "audit": {
             "ocr_engine": "pytesseract",
-            "extractor_version": "rule-v1",
+            "extractor_version": "hybrid-v2",
+            "extraction_mode": used_extraction_mode,
             "rule_set_version": "2026.02",
         },
     }
@@ -356,13 +331,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True, type=Path, help="Input image path")
     parser.add_argument("--output", required=True, type=Path, help="Output directory")
     parser.add_argument("--template", type=Path, default=None, help="Template path (DOCX/HWPX/TXT)")
+    parser.add_argument(
+        "--extraction-mode",
+        choices=["llm_hybrid", "rule_only"],
+        default="llm_hybrid",
+        help="Field extraction mode",
+    )
     return parser
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_arg_parser().parse_args()
-    run_pipeline(args.input, args.output, args.template)
+    run_pipeline(args.input, args.output, args.template, extraction_mode=args.extraction_mode)
 
 
 if __name__ == "__main__":
